@@ -49,7 +49,7 @@ Python 3.12 / FastAPI / SQLAlchemy / PostgreSQL16 / Redis7 / scikit-learn1.6；�
 
 `backend/src/models.py` 定义领域模型；`schemas.py` 校验输入；`recipe_service.py` 承担领域规则和审计；`app.py` 路由及两道中间件；`atlas.py` 纯 Python ML；`worker.py` 消费队列、记录心跳；`backend/scripts/seed_demo.py` 幂等数据。首次启动 SQLAlchemy metadata 建表，本小型项目不含后续在线迁移工具。
 
-前端 `src/api.js` API、`store.js` 状态、`utils.js` 格式与反馈、`components/common.js` 标题/状态/光谱/证据表、`pages/` 九个业务页面。角色与试验状态枚举分别位于 `backend/src/constants.py` 与 `frontend/src/constants.js`。
+前端 `src/api.js` API、`store.js` 状态、`utils.js` 格式与反馈、`components/common.js` 标题/状态/光谱/证据表、`pages/` 十个业务页面。角色与试验状态枚举分别位于 `backend/src/constants.py` 与 `frontend/src/constants.js`。
 
 本地后端：创建 Python3.12 venv，安装 `backend/requirements.txt`，设置 DATABASE_URL/REDIS_URL 指向映射端口，进入 backend 运行 `uvicorn src.app:app --reload`；worker 同目录运行 `python -m src.worker`（本地 `/artifacts` 路径需有写权限）。本地前端可经现成 Nginx 容器开发，修改后 compose build frontend。
 
@@ -95,3 +95,21 @@ Seed再补5个染料批次：A80kg、B40kg、C20kg可用，C隔离5kg、B已过�
 续篇剧本：为200kg靛蓝缸称A3.6/B0.8/C0.4kg→色差实测合格并签放→禾里服装收样，林工签收后记录标准光源色差争议→申请100kg补染→主管批准→新试验关联新缸，称A1.6/B0.4/C0.2kg→新缸正常实测签放→主管关闭客诉。新库存、客户与补染证据独立归档`test-artifacts/gb-1021/v3/`。
 
 限制：库存仅染料批次扣料，不包含采购、货位、退库与盘点；客户运单和签收为本地人工凭据，未调用物流或客户门户。补染不出款、不改旧发样结论，不含合同索赔金额。Lab、光谱和工艺门限仍为模拟业务，需真实仪器及客户容差规范校准。
+
+## V4：客户接受概率与联合发样匹配
+
+厂内 ΔE 合格仍可能被客户拒收。新增第十页"智能发样匹配"，把已签收结论变成发样依据：
+
+- **接受概率模型**：`acceptance_service.py` 读取已签收且有结论（accepted/disputed）的发样单，以发样实测 Lab 与客户目标色的 ΔE76 为特征，训练 L2 正则逻辑回归 P(接受)=σ(w₀+w₁·ΔE)（λ=1.0，牛顿法，截距不罚，确定性收敛）。训练只读历史结论，不改写。
+- **按生产缸分组检验**：每张发样单对应唯一生产缸，分组交叉验证即留一缸验证；报告 logloss/Brier/命中率并与各折基准接受率对比。已签收结论不足 6 条、接受或争议任一类不足 2 条、或分组检验不优于基准时判为证据不足，方案状态 `insufficient`，不给任何推荐。
+- **联合匹配**：`CustomerTarget` 每客户一条目标色（客户名唯一）。候选为已签放且未发样缸。匈牙利算法在"概率≥0.60 才可配"约束下最大化全局接受概率和：每客至多一缸、同缸不分给两客。`MatchRun.model_snapshot` 保存训练依据（样本数、两类分布、系数、检验表现、来源运单清单）；`MatchItem.candidates` 保存每对客户-缸的概率与落选原因（低于门限 / 改配他缸 / 分派他客）。
+- **确认发样**：主管确认时单事务按缸号顺序加锁复核；任一缸已被别处发走或状态变更则整单拒绝（方案置 `rejected` 并留原因），可按剩余缸重算（rematch 生成同客户新方案）。并发确认不同方案由行锁与缸号/运单唯一约束兜底，冲突方整单拒绝，不重复发缸。确认成功生成真实 `ColorDispatch`（运单 `QISE-MATCH-方案号-明细号`，快照含客户目标色、客户 ΔE 与匹配概率）；已确认方案重试直接返回原结果，写入中断后重试不新增发样单。
+- 匹配生成的发样单走既有签收/结论流程，新结论回流为下一轮训练样本；历史签收结论始终不可改写。
+
+接口：`GET/POST /customer-targets`、`GET/POST /match-runs`、`POST /match-runs/{id}/confirm`（主管）、`POST /match-runs/{id}/rematch`。调色师可录入目标色与发起/重算匹配，主管确认发样，观察员只读。
+
+新代码：`matching_models.py`、`matching_schemas.py`、`acceptance_service.py`、`matching_service.py`、`matching_routes.py`，前端 `pages/matching.js`。四张新表自动补建，无旧表列变更。
+
+Seed 新增 12 条历史签收结论（ΔE≤1.5 接受、≥1.7 争议，全部厂内合格仍被部分拒收）、6 口已签放未发样候选缸（DB-READY-01~06）与禾里服装、南山家纺两条客户目标色；重复 seed 只补缺项，不覆盖既有结论、方案与人工修改。
+
+演示续篇：录入北野户外目标色→发起匹配（禾里→DB-READY-01、南山→DB-READY-02，北野概率不足不推荐）→主管确认生成两张真实发样单→重试确认不新增→手工把 DB-READY-05 发走后确认另一方案被整单拒绝→按剩余缸重算。
